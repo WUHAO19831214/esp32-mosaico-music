@@ -3,6 +3,7 @@ node_modules/
 .venv/
 app/config.json
 app/assets/*.dfn
+app/assets/*.afn
 evidence/
 __pycache__/
 *.pyc

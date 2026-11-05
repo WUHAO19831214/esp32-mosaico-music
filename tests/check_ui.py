@@ -27,20 +27,24 @@ assert model.action(s,'submit').q=='周杰a' and s.page=='songs'
 assert model.truncate('周杰伦的歌',4)=='周杰伦…'
 assert not model.linked(s,0)
 
-class Font:
-    def __init__(self,p):
-        data=Path(p).read_bytes();magic,asc,desc,advance,_,count,fallback=struct.unpack('<4shhhHII',data[:20])
-        assert magic==b'DFN1' and count<=4096
-        self.glyphs={};self.advance={};base=20+count*18
-        for i in range(count):
-            cp,offset,adv,xoff,yoff,w,h=struct.unpack('<IIhhhHH',data[20+18*i:38+18*i]);stride=(w+7)//8
-            raw=data[base+offset:base+offset+stride*h];assert len(raw)==stride*h
-            mask=Image.frombytes('1',(w,h),raw)
-            self.glyphs[chr(cp)]=mask.convert('L');self.advance[chr(cp)]=adv
-    def close(self,*args):pass
 class Screen:
-    def __init__(self):self.im=Image.new('RGB',(480,480));self.d=ImageDraw.Draw(self.im)
-    def color(self,c):return(c>>16&255,c>>8&255,c&255)
+    def __init__(self):
+        self.im=Image.new('RGB',(480,480));self.d=ImageDraw.Draw(self.im)
+        # Keep binary strings inside Lua; pass byte values across Lupa's UTF-8 boundary.
+        self.blit=lua.eval('function(draw)return function(_,x,y,raw,opts)draw(x,y,{raw:byte(1,#raw)},opts)end end')(self.blit_bytes)
+    def blit_bytes(self,x,y,raw,opts):
+        assert opts['format']=='rgb565'
+        data=bytes(raw[i] for i in range(1,len(raw)+1));w=opts['width'];h=opts['height']
+        assert len(data)==w*h*2 and isinstance(x,int) and isinstance(y,int)
+        pixels=[]
+        for (c,) in struct.iter_unpack('<H',data):
+            r=c>>11;g=c>>5&63;b=c&31
+            pixels.append((r*255//31,g*255//63,b*255//31))
+        tile=Image.new('RGB',(w,h));tile.putdata(pixels);self.im.paste(tile,(x,y))
+    def color(self,c):
+        # Match the device's default RGB565 framebuffer, including flat fills.
+        r=(c>>19)&31;g=(c>>10)&63;b=(c>>3)&31
+        return(r*255//31,g*255//63,b*255//31)
     def begin(self,o):self.d.rectangle((0,0,480,480),fill=self.color(o['clear']))
     def fill_rect(self,x,y,w,h,c):
         assert all(isinstance(a,int)for a in(x,y,w,h));self.d.rectangle((x,y,x+w-1,y+h-1),fill=self.color(c))
@@ -48,12 +52,21 @@ class Screen:
         assert all(isinstance(a,int)for a in(x,y,w,h,r));self.d.rounded_rectangle((x,y,x+w-1,y+h-1),r,fill=self.color(c))
     def fill_circle(self,x,y,r,c):self.d.ellipse((x-r,y-r,x+r,y+r),fill=self.color(c))
     def line(self,x,y,x1,y1,c):self.d.line((x,y,x1,y1),fill=self.color(c))
-    def text(self,x,y,text,opts):
-        f=opts['font'];mask=f.glyphs.get(text,f.glyphs['?']);self.im.paste(self.color(opts['color']),(x,y),mask)
-    def measure_text(self,text,opts):return opts['font'].advance.get(text,12),28
     def present(self):return True
 render=lua.execute((ROOT/'app/scripts/render.lua').read_text())
-render.init(lua.table_from({'load_font':Font}),str(ROOT/'app'))
+render.init(lua.table_from({}),str(ROOT/'app'))
+for name in ['body-28','detail-22','title-34']:
+    data=b''.join(p.read_bytes() for p in sorted((ROOT/'app/assets').glob(name+'-*.afn')))
+    magic,w,h,count,fallback=struct.unpack('<4sHHII',data[:16]);assert magic==b'AFN1'
+    records=[struct.unpack_from('<IIHH',data,16+i*12) for i in range(count)]
+    mapping={cp:(offset,length,advance) for cp,offset,length,advance in records}
+    assert len(mapping)==count and all(ord(c) in mapping for c in '莫扎特周杰伦日本語')
+    assert ord('?')==fallback
+    for cp in [ord(c) for c in '莫扎特周杰伦WQgj?']:
+        offset,length,advance=mapping[cp];raw=data[16+count*12+offset:16+count*12+offset+length]
+        assert sum((b&15)+1 for b in raw)==w*h and advance>0
+        assert any(0<(b>>4)<15 for b in raw), 'Font must retain intermediate alpha coverage'
+
 screen=Screen();s=model.new()
 for page in ['now','songs','search','account','lists','settings','bluetooth','outputs']:
     s.page=page;render.draw(screen,s,1000);screen.im.save(ROOT/f'evidence/{page}.png')
@@ -121,4 +134,17 @@ model.feed(s,lua.table_from({'result_total':104.0,'result_offset':99.0,'results'
 s.page='songs';event=model.action(s,'nextpage');assert event.action=='devicepage'and event.offset==102
 model.feed(s,lua.table_from({'result_total':104.0,'result_offset':102.0,'results':lua.table_from([]),'page_size':3.0}),1000)
 assert model.action(s,'nextpage').offset==102 and model.action(s,'backpage').offset==99
+# Cover file-shard boundaries in the production reader, not only ASCII UI labels.
+alpha=lua.execute((ROOT/'app/scripts/font.lua').read_text())
+for name in ['body-28','detail-22','title-34']:
+    data=b''.join(p.read_bytes() for p in sorted((ROOT/'app/assets').glob(name+'-*.afn')))
+    _,w,h,count,_=struct.unpack('<4sHHII',data[:16]);base=16+count*12
+    crossings=[]
+    for i in range(count):
+        cp,offset,length,_=struct.unpack_from('<IIHH',data,16+i*12)
+        if (base+offset)//262144 != (base+offset+length-1)//262144:crossings.append(cp)
+    assert crossings
+    f=alpha.open(str(ROOT/f'app/assets/{name}.afn'))
+    for cp in crossings:alpha.paint(screen,f,0,0,cp,0xff202124,0xffffffff)
+    alpha.close(f)
 render.close();print('Pinyin Chinese input, UTF-8 deletion, event protocol, output controls, pagination and eight screen layouts passed')
