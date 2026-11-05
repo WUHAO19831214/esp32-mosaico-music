@@ -1,0 +1,9 @@
+node_modules/
+.local/
+.venv/
+app/config.json
+app/assets/*.dfn
+evidence/
+__pycache__/
+*.pyc
+.DS_Store
